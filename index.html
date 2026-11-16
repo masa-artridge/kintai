@@ -47,6 +47,9 @@
   .tile.onbreak { border-color: var(--orange); background: var(--orangebg); }
   .tile.onbreak .badge { background: var(--orange); color: #fff; }
   .tile.done .badge { background: var(--gray); color: #fff; }
+  .tile .fw { font-size: 14px; color: #fff; background: var(--red); padding: 3px 10px; border-radius: 6px; font-weight: 700; }
+  .warnbox { background: #fdecea; border: 2px solid var(--red); color: #7a1f16; border-radius: 14px; padding: 14px 20px;
+    font-size: 19px; line-height: 1.6; margin-bottom: 20px; max-width: 760px; width: 100%; text-align: center; }
   .empty { background: var(--card); border-radius: 16px; padding: 40px; text-align: center; color: var(--sub); font-size: 20px; }
 
   /* 打刻画面 */
@@ -189,6 +192,9 @@ const WD = ['日', '月', '火', '水', '木', '金', '土'];
 const wday = ds => { const [y, m, d] = ds.split('-').map(Number); return new Date(y, m - 1, d).getDay(); };
 const empName = id => (DB.employees.find(e => e.id === id) || {}).name || '(削除済み)';
 const activeEmps = () => DB.employees.filter(e => !e.retired);
+// 出勤からこの時間を過ぎても退勤がない記録は「退勤の押し忘れ」とみなす
+const FORGET_HOURS = 16;
+const startTs = r => { const [y, m, d] = r.date.split('-').map(Number); const [h, mi] = r.in.split(':').map(Number); return new Date(y, m - 1, d, h, mi).getTime(); };
 
 /* ---------- 計算 ---------- */
 // 1件の記録から A〜D を出す（日をまたいだ退勤にも対応）
@@ -204,7 +210,8 @@ function calcRecord(r) {
     if (e == null) e = outM;           // 休憩戻りを押し忘れたら退勤時刻で締める
     if (s != null && e != null && e > s) brk += e - s;
   }
-  if (r.autoBreak) brk += DB.settings.autoBreakMin;
+  // 「30分休憩 退勤」：休憩は30分。休憩ボタンで30分より長く記録していれば、その時間
+  if (r.autoBreak) brk = Math.max(brk, DB.settings.autoBreakMin);
   if (outM == null) return { inM, outM: null, brk, total: null };
   const total = Math.max(0, outM - inM - brk);
   return { inM, outM, brk, total };
@@ -236,20 +243,31 @@ function monthRows(empId, ym) {
 }
 
 /* ---------- 打刻 ---------- */
+const HOUR = 3600000;
+// いま勤務中の記録（出勤から16時間以内で、退勤がまだのもの）
 function openRecord(empId) {
-  const t = today(), y = yesterday();
-  const list = DB.records.filter(r => r.empId === empId && !r.out && (r.date === t || r.date === y));
-  return list.sort((a, b) => (b.date + b.in).localeCompare(a.date + a.in))[0] || null;
+  const now = Date.now();
+  const list = DB.records.filter(r => r.empId === empId && !r.out && r.in &&
+    now - startTs(r) < FORGET_HOURS * HOUR && startTs(r) - now < HOUR);
+  return list.sort((a, b) => startTs(b) - startTs(a))[0] || null;
+}
+// 退勤の押し忘れ（出勤から16時間を過ぎても退勤がないもの。45日より前は出さない）
+function forgotten(empId) {
+  const now = Date.now();
+  return DB.records.filter(r => r.empId === empId && !r.out && r.in &&
+    now - startTs(r) >= FORGET_HOURS * HOUR && now - startTs(r) < 45 * 24 * HOUR)
+    .sort((a, b) => startTs(a) - startTs(b));
 }
 function status(empId) {
+  const forgot = forgotten(empId);
   const o = openRecord(empId);
   if (o) {
     const b = o.breaks[o.breaks.length - 1];
-    if (b && !b.e) return { key: 'onbreak', label: '休憩中', rec: o };
-    return { key: 'working', label: '勤務中', rec: o };
+    if (b && !b.e) return { key: 'onbreak', label: '休憩中', rec: o, forgot };
+    return { key: 'working', label: '勤務中', rec: o, forgot };
   }
   const done = DB.records.some(r => r.empId === empId && r.date === today() && r.out);
-  return done ? { key: 'done', label: '退勤済み' } : { key: 'off', label: '未出勤' };
+  return done ? { key: 'done', label: '退勤済み', forgot } : { key: 'off', label: '未出勤', forgot };
 }
 function punch(empId, kind) {
   const now = hmStr(new Date());
@@ -270,11 +288,12 @@ function punch(empId, kind) {
     msg = '休憩から戻りました';
   } else if (kind === 'out' || kind === 'out30') {
     if (!o) return;
+    if (kind === 'out' && o.breaks.length) return;   // 休憩を記録した日は「休憩無 退勤」は押せない
     const b = o.breaks[o.breaks.length - 1];
     if (b && !b.e) b.e = now;
     o.out = now;
     o.autoBreak = kind === 'out30';
-    msg = kind === 'out30' ? `退勤しました（${DB.settings.autoBreakMin}分休憩あり）` : '退勤しました';
+    msg = kind === 'out30' ? `退勤しました（${DB.settings.autoBreakMin}分休憩）` : '退勤しました（休憩なし）';
   }
   save();
   go('home');
@@ -326,7 +345,7 @@ function vHome() {
   const emps = activeEmps();
   const tiles = emps.length ? `<div class="tiles">${emps.map(e => {
     const s = status(e.id);
-    return `<button class="tile ${s.key}" data-a="emp" data-id="${e.id}"><div class="nm">${esc(e.name)}</div><div class="badge">${s.label}</div></button>`;
+    return `<button class="tile ${s.key}" data-a="emp" data-id="${e.id}"><div class="nm">${esc(e.name)}</div><div class="badge">${s.label}</div>${s.forgot.length ? '<div class="fw">退勤の押し忘れあり</div>' : ''}</button>`;
   }).join('')}</div>`
     : `<div class="empty">従業員がまだ登録されていません。<br>右上の「管理」から登録してください。</div>`;
   return header('勤怠管理', `<button class="btn-admin" data-a="admin">管理</button>`) +
@@ -340,16 +359,21 @@ function vAct() {
   const s = status(e.id);
   let info = s.label;
   if (s.rec) info += `（出勤 ${s.rec.in}${s.rec.date !== today() ? '・前日' : ''}）`;
-  const can = { in: !s.rec, brk: s.key === 'working', ret: s.key === 'onbreak', out: !!s.rec };
+  const tookBreak = !!(s.rec && s.rec.breaks.length);
+  const can = { in: !s.rec, brk: s.key === 'working', ret: s.key === 'onbreak', out30: !!s.rec, out0: !!s.rec && !tookBreak };
   const ab = DB.settings.autoBreakMin;
+  const forgotBox = s.forgot.length ? `<div class="warnbox">${s.forgot.map(r => {
+      const [, mm, dd] = r.date.split('-').map(Number);
+      return `${mm}月${dd}日（${WD[wday(r.date)]}）${r.in} 出勤`; }).join('、')} の<b>退勤が押されていません</b>。<br>
+      管理者に退勤した時刻を伝えてください。きょうの出勤はこのまま押せます。</div>` : '';
   return header('勤怠管理') + `<div class="act">
-    <div class="who">${esc(e.name)} さん</div><div class="st">いまの状態：${info}</div>
+    <div class="who">${esc(e.name)} さん</div><div class="st">いまの状態：${info}</div>${forgotBox}
     <div class="acts">
       <button class="abtn b-in" data-a="p" data-k="in" ${can.in ? '' : 'disabled'}>出勤</button>
       <button class="abtn b-brk" data-a="p" data-k="brk" ${can.brk ? '' : 'disabled'}>休憩</button>
       <button class="abtn b-ret" data-a="p" data-k="ret" ${can.ret ? '' : 'disabled'}>休憩戻り</button>
-      <button class="abtn b-out" data-a="p" data-k="out" ${can.out ? '' : 'disabled'}>退勤<small>休憩なし／休憩ボタンで記録済み</small></button>
-      <button class="abtn b-out30" data-a="p" data-k="out30" ${can.out ? '' : 'disabled'}>退勤<small>${ab}分休憩あり</small></button>
+      <button class="abtn b-out30" data-a="p" data-k="out30" ${can.out30 ? '' : 'disabled'}>${ab}分休憩　退勤</button>
+      <button class="abtn b-out" data-a="p" data-k="out" ${can.out0 ? '' : 'disabled'}>休憩無　退勤${tookBreak ? '<small>休憩したので押せません</small>' : ''}</button>
     </div>
     <button class="back" data-a="home">もどる</button></div>`;
 }
@@ -518,7 +542,7 @@ function drawEdit() {
         <input class="inp" type="time" data-bi="${i}" data-bk="e" value="${b.e || ''}">
         <button class="sbtn mini red" data-a="brkdel" data-k="${i}">消す</button></div>`).join('') || '<p class="note" style="margin:0 0 8px">なし</p>'}
       <button class="sbtn mini ghost" data-a="brkadd">＋ 休憩を足す</button></div>
-    <label class="chk"><input type="checkbox" id="e_auto" ${r.autoBreak ? 'checked' : ''}> ${DB.settings.autoBreakMin}分休憩ありで退勤（上の休憩に${DB.settings.autoBreakMin}分を足します）</label>
+    <label class="chk"><input type="checkbox" id="e_auto" ${r.autoBreak ? 'checked' : ''}> ${DB.settings.autoBreakMin}分休憩　退勤（休憩を${DB.settings.autoBreakMin}分として計算。上の休憩がそれより長ければ、その時間）</label>
     <p class="note">退勤が出勤より早い時刻なら、日をまたいだ勤務（翌日の退勤）として計算します。</p>
     <div class="mbtns"><div>${r.id ? '<button class="sbtn red" data-a="recdel">この記録を消す</button>' : ''}</div>
       <div class="row"><button class="sbtn gray" data-a="close">やめる</button><button class="sbtn" data-a="recsave">保存する</button></div></div>
